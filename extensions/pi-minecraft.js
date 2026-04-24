@@ -8,9 +8,10 @@ module.exports = function minecraftExtension(pi) {
   const systemPromptPath = path.join(packageRoot, "system.md");
   let chatListener = null;
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     stopChatListener(chatListener);
     chatListener = null;
+    if (ctx && ctx.cwd) await stopManagedBot(ctx.cwd, botScript);
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
@@ -136,13 +137,7 @@ module.exports = function minecraftExtension(pi) {
 
       stopChatListener(chatListener);
       chatListener = null;
-      process.kill(state.pid, "SIGTERM");
-      const stopped = await waitForExit(state.pid, 3000);
-      if (!stopped && isManagedProcess(state.pid, botScript)) {
-        process.kill(state.pid, "SIGKILL");
-        await waitForExit(state.pid, 1000);
-      }
-      clearState(ctx.cwd);
+      await stopManagedBot(ctx.cwd, botScript);
       notify(
         ctx,
         `stopped mcbot: pid ${state.pid}; Minecraft bot instructions disabled`,
@@ -187,6 +182,32 @@ module.exports = function minecraftExtension(pi) {
     },
   });
 };
+
+async function stopManagedBot(cwd, botScript) {
+  const state = await readState(cwd);
+  if (!state) return { status: "not-running" };
+  if (!isManagedProcess(state.pid, botScript)) {
+    clearState(cwd);
+    return { status: "stale", pid: state.pid };
+  }
+
+  signalProcess(state.pid, "SIGTERM");
+  const stopped = await waitForExit(state.pid, 3000);
+  if (!stopped && isManagedProcess(state.pid, botScript)) {
+    signalProcess(state.pid, "SIGKILL");
+    await waitForExit(state.pid, 1000);
+  }
+  clearState(cwd);
+  return { status: "stopped", pid: state.pid };
+}
+
+function signalProcess(pid, signal) {
+  try {
+    process.kill(pid, signal);
+  } catch (error) {
+    if (!error || error.code !== "ESRCH") throw error;
+  }
+}
 
 function ensureChatListener(pi, ctx, current, hostPort) {
   if (current && current.hostPort === hostPort) return current;
