@@ -188,6 +188,8 @@ function createServer(bot, config) {
 function createChatBroadcaster(bot) {
   const clients = new Set();
   bot.on("chat", (username, message, translate, jsonMsg, matches) => {
+    if (username === bot.username) return;
+
     const event = {
       type: "chat",
       username,

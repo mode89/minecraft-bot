@@ -75,6 +75,32 @@ test("/listen streams chat messages as NDJSON chunks", async (t) => {
   controller.abort();
 });
 
+test("/listen filters out the bot's own chat messages", async (t) => {
+  const { bot, listenUrl } = await createFixture(t);
+  const controller = new AbortController();
+  bot.username = "mcbot";
+
+  const response = await fetch(listenUrl, { signal: controller.signal });
+  assert.equal(response.status, 200);
+
+  const next = readNextLine(response.body.getReader());
+  bot.emit("chat", "mcbot", "ignore me");
+  assert.equal(
+    await Promise.race([
+      next.then(() => "line"),
+      delay(30).then(() => "timeout"),
+    ]),
+    "timeout",
+  );
+
+  bot.emit("chat", "Alex", "deliver me");
+  const event = JSON.parse(await next);
+  assert.equal(event.username, "Alex");
+  assert.equal(event.message, "deliver me");
+
+  controller.abort();
+});
+
 test("empty and unicode bodies are handled", async (t) => {
   const { url } = await createFixture(t);
 
@@ -404,6 +430,7 @@ function createFakeBot() {
   bot.usingHeldItem = false;
   bot.diggingStopped = false;
   bot.calls = [];
+  bot.username = "mcbot";
   bot.entity = { position: { x: 0, y: 64, z: 0 } };
 
   bot.setControlState = (state, value) => {
