@@ -247,6 +247,68 @@ test("client disconnect aborts the request, cleans up, and "
   assertClean(bot);
 });
 
+test("client disconnect does not leak helper promise abort rejections", async (t) => {
+  const { url } = await createFixture(t, { defaultTimeoutMs: 1000 });
+  const observed = observeUnhandledRejection();
+
+  try {
+    await abandonPost(url, `
+      sleep(10000)
+      await sleep(10000)
+    `, 20);
+
+    const reason = await Promise.race([
+      observed.promise,
+      delay(50).then(() => null),
+    ]);
+    assert.equal(reason, null, reason && reason.stack || String(reason));
+  } finally {
+    observed.cleanup();
+  }
+});
+
+test("detached eval continuation cannot mutate bot after abort", async (t) => {
+  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 1000 });
+
+  await abandonPost(url, `
+    const setControlState = bot.setControlState
+    const pathfinder = bot.pathfinder
+    try { await sleep(10000) } catch {}
+    for (const action of [
+      () => bot.setControlState('jump', true),
+      () => setControlState('jump', true),
+      () => pathfinder.setGoal({ name: 'late-goal' }),
+    ]) {
+      try { action() } catch {}
+    }
+  `, 20);
+  await delay(50);
+
+  assert.equal(!!bot.controlState.jump, false);
+  assert.equal(bot.pathfinder.goal, null);
+});
+
+test("client disconnect suppresses nested dig abort rejections", async (t) => {
+  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 1000 });
+  bot.lookAt = () => new Promise(() => {});
+  bot.dig = async () => {
+    await bot.lookAt({ x: 1, y: 2, z: 3 });
+  };
+
+  const observed = observeUnhandledRejection();
+  try {
+    await abandonPost(url, "await bot.dig({ name: 'test_block' })", 20);
+
+    const reason = await Promise.race([
+      observed.promise,
+      delay(50).then(() => null),
+    ]);
+    assert.equal(reason, null, reason && reason.stack || String(reason));
+  } finally {
+    observed.cleanup();
+  }
+});
+
 test("fire-and-forget patched awaitables are aborted "
   + "and cleaned", async (t) => {
   const { bot, url } = await createFixture(t);
@@ -519,6 +581,16 @@ function abandonPost(url, body, destroyAfterMs) {
     req.end(body);
     setTimeout(() => req.destroy(), destroyAfterMs);
   });
+}
+
+function observeUnhandledRejection() {
+  let cleanup = () => {};
+  const promise = new Promise((resolve) => {
+    const handler = (reason) => resolve(reason);
+    process.on("unhandledRejection", handler);
+    cleanup = () => process.off("unhandledRejection", handler);
+  });
+  return { promise, cleanup };
 }
 
 async function readNextLine(reader) {

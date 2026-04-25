@@ -378,12 +378,12 @@ function createEvalSession(runtime, req, res) {
 // Build the sandbox-visible bindings for user code.
 function buildEvalContext(session) {
   return {
-    bot: session.bot,
+    bot: createAbortGuardedProxy(session, session.bot),
     goals,
     Vec3,
     print: (...args) => session.output.push(util.format(...args)),
-    sleep: createSleep(session.timers, session.signal),
-    withTimeout: createWithTimeout(session.timers, session.signal),
+    sleep: createSleep(session),
+    withTimeout: createWithTimeout(session),
     abort: session.signal,
     timers: createBlockedTimers(),
   };
@@ -486,6 +486,53 @@ function writeEvalResult(session, scriptError, cleanupErrors) {
 // ---------------------------------------------------------------------------
 // Request patches
 
+// Create a bot facade that prevents detached eval continuations from touching
+// the real bot after the request has aborted. Sub-objects are recursively
+// proxied through a per-session cache so identity is stable within a request.
+function createAbortGuardedProxy(session, root) {
+  const { signal } = session;
+  const cache = new WeakMap();
+
+  function wrap(target) {
+    if (target === null
+      || (typeof target !== "object" && typeof target !== "function")
+      || target instanceof Promise) {
+      return target;
+    }
+    if (cache.has(target)) return cache.get(target);
+
+    const proxy = new Proxy(target, {
+      get(object, property, receiver) {
+        signal.throwIfAborted();
+        const value = Reflect.get(object, property, receiver);
+        if (typeof value === "function") {
+          // Re-check at call time so methods captured into local variables
+          // before abort cannot be invoked afterwards. Bind to the real
+          // object so library internals see the unwrapped this.
+          return (...args) => {
+            signal.throwIfAborted();
+            return Reflect.apply(value, object, args);
+          };
+        }
+        return wrap(value);
+      },
+      set(object, property, value, receiver) {
+        signal.throwIfAborted();
+        return Reflect.set(object, property, value, receiver);
+      },
+      deleteProperty(object, property) {
+        signal.throwIfAborted();
+        return Reflect.deleteProperty(object, property);
+      },
+    });
+
+    cache.set(target, proxy);
+    return proxy;
+  }
+
+  return wrap(root);
+}
+
 // Install all per-request bot behavior patches.
 function installRequestPatches(session) {
   patchControlState(session);
@@ -570,7 +617,10 @@ function patchDigging(session) {
 function patchContainers(session) {
   for (const method of ["openContainer", "openChest"]) {
     patchMethod(session, session.bot, method, (original) => (...args) => {
-      const opening = callPromise(original, args).then((window) => {
+      if (session.signal.aborted) return Promise.reject(session.signal.reason);
+      const originalPromise = callPromise(original, args);
+      suppressOriginalPromise(originalPromise);
+      const opening = originalPromise.then((window) => {
         if (window) {
           session.cleanup.deferOnce(`window:${window.id ?? method}`, () => {
             // Only close the window this request opened; do not close a newer
@@ -640,7 +690,9 @@ function patchMethod(session, target, method, wrap) {
 // Wrap an awaitable method with abort racing and promise tracking.
 function patchAwaitable(session, target, method) {
   patchMethod(session, target, method, (original) => (...args) => {
+    if (session.signal.aborted) return Promise.reject(session.signal.reason);
     const promise = callPromise(original, args);
+    suppressOriginalPromise(promise);
     return trackPromise(session, raceAbort(session.signal, promise, null));
   });
 }
@@ -648,8 +700,10 @@ function patchAwaitable(session, target, method) {
 // Wrap an awaitable method that has an explicit cancellation action.
 function patchCancelable(session, target, method, cleanupKey, cancel) {
   patchMethod(session, target, method, (original) => (...args) => {
+    if (session.signal.aborted) return Promise.reject(session.signal.reason);
     session.cleanup.deferOnce(cleanupKey, cancel);
     const promise = callPromise(original, args);
+    suppressOriginalPromise(promise);
     return trackPromise(session, raceAbort(session.signal, promise, () => {
       // Abort runs native cancellation immediately; mark the cleanup discharged
       // so the finally path does not repeat the same cancellation.
@@ -679,6 +733,19 @@ function trackPromise(session, promise) {
   // unhandled rejection from a fire-and-forget eval call.
   promise.catch(() => {});
   return promise;
+}
+
+// Suppress late rejections from underlying library promises after the request
+// abort race has already settled. raceAbort attaches .then(v, e) to the
+// outermost promise we get back from a mineflayer call, but the libraries
+// build internal .then-chains and event-driven sub-promises we never see;
+// when our cleanup (e.g. bot.stopDigging()) cancels the operation after the
+// wrapper has already rejected with the abort, those library-internal
+// descendants reject with no handler attached. This terminal .catch marks the
+// whole library-managed chain as observed. The wrapper still surfaces real
+// errors to awaited eval code when the underlying operation wins the race.
+function suppressOriginalPromise(promise) {
+  promise.catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -778,26 +845,27 @@ function createTimerScope() {
 // Eval helpers
 
 // Create the abort-aware sleep helper exposed to eval scripts.
-function createSleep(timers, signal) {
+function createSleep(session) {
   return (ms, value) => {
-    const delay = createAbortableDelay(timers, signal, ms);
-    return delay.promise.then(() => value);
+    const delay = createAbortableDelay(session.timers, session.signal, ms);
+    return trackPromise(session, delay.promise.then(() => value));
   };
 }
 
 // Create the abort-aware withTimeout helper exposed to eval scripts.
-function createWithTimeout(timers, signal) {
+function createWithTimeout(session) {
   // Race a supplied promise against an abort-aware local timeout.
   return function withTimeout(ms, promise) {
     if (arguments.length < 2) {
       throw new TypeError("withTimeout(ms, promise) requires a promise");
     }
 
-    const delay = createAbortableDelay(timers, signal, ms);
-    return Promise.race([
+    const delay = createAbortableDelay(session.timers, session.signal, ms);
+    const result = Promise.race([
       Promise.resolve(promise),
       delay.promise.then(() => { throw makeTimeoutError(delay.ms); }),
     ]).finally(delay.cancel);
+    return trackPromise(session, result);
   };
 }
 
