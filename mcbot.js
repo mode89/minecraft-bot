@@ -636,7 +636,11 @@ function patchListeners(session) {
 function patchBotAwaitables(session) {
   for (const method of [
     "equip", "unequip", "toss", "tossStack", "consume",
-    "craft", "placeBlock", "activateBlock", "lookAt",
+    "craft", "placeBlock", "activateBlock",
+    "lookAt", "look", "waitForTicks", "elytraFly",
+    "activateEntity", "activateEntityAt",
+    "sleep", "wake", "fish", "trade",
+    "writeBook", "signBook",
   ]) {
     patchAwaitable(session, session.bot, method);
   }
@@ -649,9 +653,13 @@ function patchDigging(session) {
   });
 }
 
-// Patch container-opening methods so opened windows are closed.
+// Patch window-opening methods so opened windows are closed on cleanup.
 function patchContainers(session) {
-  for (const method of ["openContainer", "openChest"]) {
+  for (const method of [
+    "openContainer", "openChest", "openDispenser",
+    "openFurnace", "openAnvil", "openEnchantmentTable",
+    "openVillager", "openBlock", "openEntity",
+  ]) {
     patchMethod(session, session.bot, method, (original) => (...args) => {
       if (session.signal.aborted) return Promise.reject(session.signal.reason);
       const originalPromise = callPromise(original, args);
