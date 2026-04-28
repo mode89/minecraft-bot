@@ -21,14 +21,12 @@ The bot runs at `http://localhost:3000/eval` (unless told otherwise).
   with status 500. On per-request deadline, status 504 with the same shape
   plus `error: "deadline exceeded"`.
 - Each request is **hermetic**: behavior/intent state your script
-  introduces is rolled back when the script settles, when the client
-  disconnects, or when the per-request deadline fires. This includes:
-  control states (`setControlState`), in-flight `bot.goto(...)` calls,
-  event listeners you add (`bot.on/once/addListener`), open containers,
-  `activateItem`, and any pending request-scoped `sleep(...)` /
-  `withTimeout(...)` handles. Game state (position, inventory, broken/placed
-  blocks) is **not** rolled back — those are real side effects on the
-  world.
+  introduces (control states, listeners you add, in-flight long-running
+  bot calls, open containers, `activateItem`, pending `sleep(...)` /
+  `withTimeout(...)` handles) is rolled back when the script settles,
+  when the client disconnects, or when the per-request deadline fires.
+  Game state (position, inventory, broken/placed blocks) is **not**
+  rolled back — those are real side effects on the world.
 - `sleep(ms)` is an abort-aware delay helper. Use `await sleep(ms)`
   instead of raw timers. `setTimeout`, `setInterval`, and `setImmediate`
   are disabled in script scope.
@@ -93,11 +91,6 @@ The bot runs at `http://localhost:3000/eval` (unless told otherwise).
   its own — always run it under a bounded abort (deadline, timer, or
   sentinel-driven controller) and expect it to throw `AbortError` when you stop
   it.
-
-- `bot.autoEat`: auto-eats when hungry; `await bot.autoEat.eat()` to force
-
-- `bot.hawkEye`: ranged aim/shoot helpers
-  (`bot.hawkEye.oneShot(target, weapon)`)
 
 - `Vec3(x, y, z)` for positions and offsets
 

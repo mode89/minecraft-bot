@@ -9,18 +9,20 @@
 //
 // POST any JS source to http://<http>/eval and it will be evaluated in an
 // async function with `bot`, `snippets`, `Vec3`, `print`, `sleep`,
-// `withTimeout`, and `abort` (an AbortSignal) in scope. Before each eval,
-// exports from .pi/minecraft/snippets.js in the current working directory are
-// reloaded and passed as `snippets`. Anything the script passes to
-// `print(...)` is collected and returned as the response body. The script's
-// own return value is ignored.
+// `withTimeout`, and `abort` (an AbortSignal) in scope. `bot` is a curated
+// per-request facade over the mineflayer bot (see createBotFacade); the
+// underlying mineflayer bot is shared across requests and never mutated.
+// Before each eval, exports from .pi/minecraft/snippets.js in the current
+// working directory are reloaded and passed as `snippets`. Anything the script
+// passes to `print(...)` is collected and returned as the response body. The
+// script's own return value is ignored.
 //
 // Eval requests are serialized: one bot control script runs at a time.
 //
 // Each request is hermetic: behavior/intent state the script introduces
 // (control states, listeners it adds, timers it schedules, open windows,
-// activated items, in-flight `bot.goto` calls) is rolled back when the script
-// settles, when the client disconnects, or when the deadline expires.
+// activated items, in-flight long-running bot calls) is rolled back when the
+// script settles, when the client disconnects, or when the deadline expires.
 // Game/world state (position, health, inventory, broken/placed blocks) is
 // never touched.
 //
@@ -33,8 +35,6 @@
 const http = require("http");
 const path = require("path");
 const mineflayer = require("mineflayer");
-const { loader: autoEat } = require("mineflayer-auto-eat");
-const hawkEye = require("minecrafthawkeye").default;
 const Vec3 = require("vec3").Vec3;
 const pathfinder = require("./pathfinder.js");
 const util = require("util");
@@ -208,24 +208,12 @@ function createMinecraftBot(config) {
     auth: "offline",
   });
 
-  installBotPlugins(bot);
-  installBotLogging(bot);
-  return bot;
-}
-
-// Attach Mineflayer plugins, our own pathfinder, and one-time setup hooks.
-function installBotPlugins(bot) {
-  bot.loadPlugin(autoEat);
-  bot.loadPlugin(hawkEye);
-
   // Eval scripts may temporarily install many listeners. They are removed by
   // request cleanup, so the EventEmitter default of 10 only creates noise.
   bot.setMaxListeners(200);
 
-  // Expose our A*-driven walker as a normal bot method. Per-request abort is
-  // wired in by patchBotGoto; callers just `await bot.goto(goal)`.
-  bot.goto = (goal, options) => pathfinder.goto(bot, goal, options);
-  bot.follow = (target, options) => pathfinder.follow(bot, target, options);
+  installBotLogging(bot);
+  return bot;
 }
 
 // Register process-level logging for bot lifecycle events.
@@ -323,7 +311,6 @@ async function runEvalSession(runtime, req, res, code) {
   let cleanupErrors = [];
 
   try {
-    installRequestPatches(session);
     await raceAbort(
       session.deadline.signal,
       executeUserCode(buildEvalContext(session), code),
@@ -358,6 +345,10 @@ function createEvalSession(runtime, req, res) {
   // reliable client-disconnect signal, but res.close still follows the socket.
   res.on("close", onClose);
 
+  const cleanup = createCleanupStack();
+  const timers = createTimerScope();
+  cleanup.deferOnce("timers", timers.clearAll);
+
   return {
     runtime,
     bot: runtime.bot,
@@ -367,9 +358,8 @@ function createEvalSession(runtime, req, res) {
     deadline: { controller, signal, timeoutId },
     onClose,
     output,
-    cleanup: createCleanupStack(),
-    timers: createTimerScope(),
-    patches: createPatchSet(),
+    cleanup,
+    timers,
     pendingPromises: new Set(),
   };
 }
@@ -377,7 +367,7 @@ function createEvalSession(runtime, req, res) {
 // Build the sandbox-visible bindings for user code.
 function buildEvalContext(session) {
   return {
-    bot: createAbortGuardedProxy(session, session.bot),
+    bot: createBotFacade(session.bot, session),
     snippets: loadSnippets(getSnippetsPath(session.config)),
     Vec3,
     print: (...args) => session.output.push(util.format(...args)),
@@ -420,7 +410,7 @@ async function executeUserCode(context, code) {
   );
 }
 
-// Abort outstanding request work, run cleanup, and restore patches.
+// Abort outstanding request work and run cleanup.
 async function finishEvalSession(session) {
   clearTimeout(session.deadline.timeoutId);
   session.res.off("close", session.onClose);
@@ -434,14 +424,13 @@ async function finishEvalSession(session) {
 
   const cleanupErrors = await session.cleanup.run();
 
-  // Fire-and-forget patched calls may still reject after the script exits;
+  // Fire-and-forget facade calls may still reject after the script exits;
   // terminal catches keep those expected abort rejections out of process logs.
   for (const promise of session.pendingPromises) {
     promise.catch(() => {});
   }
   session.pendingPromises.clear();
 
-  session.patches.restore();
   return cleanupErrors;
 }
 
@@ -525,264 +514,213 @@ function loadSnippets(snippetsPath) {
 }
 
 // ---------------------------------------------------------------------------
-// Request patches
-
-// Create a bot facade that prevents detached eval continuations from touching
-// the real bot after the request has aborted. Sub-objects are recursively
-// proxied through a per-session cache so identity is stable within a request.
-function createAbortGuardedProxy(session, root) {
-  const { signal } = session.deadline;
-  const cache = new WeakMap();
-
-  function wrap(target) {
-    if (target === null
-      || (typeof target !== "object" && typeof target !== "function")
-      || target instanceof Promise) {
-      return target;
-    }
-    if (cache.has(target)) return cache.get(target);
-
-    const proxy = new Proxy(target, {
-      get(object, property, receiver) {
-        signal.throwIfAborted();
-        const value = Reflect.get(object, property, receiver);
-        if (typeof value === "function") {
-          // Re-check at call time so methods captured into local variables
-          // before abort cannot be invoked afterwards. Bind to the real
-          // object so library internals see the unwrapped this.
-          return (...args) => {
-            signal.throwIfAborted();
-            return Reflect.apply(value, object, args);
-          };
-        }
-        return wrap(value);
-      },
-      set(object, property, value, receiver) {
-        signal.throwIfAborted();
-        return Reflect.set(object, property, value, receiver);
-      },
-      deleteProperty(object, property) {
-        signal.throwIfAborted();
-        return Reflect.deleteProperty(object, property);
-      },
-    });
-
-    cache.set(target, proxy);
-    return proxy;
-  }
-
-  return wrap(root);
-}
-
-// Install all per-request bot behavior patches.
-function installRequestPatches(session) {
-  patchControlState(session);
-  patchListeners(session);
-  patchBotAwaitables(session);
-  patchDigging(session);
-  patchContainers(session);
-  patchBotGoto(session);
-  patchBotFollow(session);
-  patchItemUse(session);
-
-  session.cleanup.deferOnce("timers", session.timers.clearAll);
-}
-
-// Patch movement controls so active states are reset on cleanup.
-function patchControlState(session) {
-  patchMethod(session, session.bot, "setControlState", (original) => (
-    state,
-    value,
-  ) => {
-    if (value) {
-      session.cleanup.deferOnce(
-        `control:${state}`,
-        () => original(state, false),
-      );
-    }
-    return original(state, value);
-  });
-}
-
-// Patch listener registration so request-added listeners are removed.
-function patchListeners(session) {
-  const added = [];
-
-  session.cleanup.deferOnce("listeners", () => {
-    const errors = [];
-    for (const { event, listener } of added) {
-      try {
-        session.bot.removeListener(event, listener);
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    if (errors.length) throw errors[0];
-  });
-
-  const track = (event, listener) => added.push({ event, listener });
-
-  // Track once() as well: if it never fires, EventEmitter will not remove it
-  // for us before the request ends.
-  for (const method of ["on", "addListener", "once"]) {
-    patchMethod(
-      session,
-      session.bot,
-      method,
-      (original) => (event, listener) => {
-        track(event, listener);
-        return original(event, listener);
-      },
-    );
-  }
-}
-
-// Patch common awaitable bot methods to reject on request abort.
-function patchBotAwaitables(session) {
-  for (const method of [
-    "equip", "unequip", "toss", "tossStack", "consume",
-    "craft", "placeBlock", "activateBlock",
-    "lookAt", "look", "waitForTicks", "elytraFly",
-    "activateEntity", "activateEntityAt",
-    "sleep", "wake", "fish", "trade",
-    "writeBook", "signBook",
-  ]) {
-    patchAwaitable(session, session.bot, method);
-  }
-}
-
-// Patch digging so aborts invoke Mineflayer's native stop hook.
-function patchDigging(session) {
-  patchCancelable(session, session.bot, "dig", "dig", () => {
-    if (session.bot.stopDigging) session.bot.stopDigging();
-  });
-}
-
-// Patch window-opening methods so opened windows are closed on cleanup.
-function patchContainers(session) {
-  for (const method of [
-    "openContainer", "openChest", "openDispenser",
-    "openFurnace", "openAnvil", "openEnchantmentTable",
-    "openVillager", "openBlock", "openEntity",
-  ]) {
-    patchMethod(session, session.bot, method, (original) => (...args) => {
-      if (session.deadline.signal.aborted) {
-        return Promise.reject(session.deadline.signal.reason);
-      }
-      const originalPromise = callPromise(original, args);
-      suppressOriginalPromise(originalPromise);
-      const opening = originalPromise.then((window) => {
-        if (window) {
-          session.cleanup.deferOnce(`window:${window.id ?? method}`, () => {
-            // Only close the window this request opened; do not close a newer
-            // current window that may have replaced it.
-            if (session.bot.currentWindow === window) {
-              session.bot.closeWindow(window);
-            }
-          });
-        }
-        return window;
-      });
-      return trackPromise(
-        session,
-        raceAbort(session.deadline.signal, opening, null),
-      );
-    });
-  }
-}
-
-// Patch bot.goto so per-request abort is auto-injected.
+// Bot facade
 //
-// Eval callers do not pass a signal; we always thread session.deadline.signal
-// into the goto call so its internal cleanup (clearing forward/jump/sprint)
-// runs on script end. Then we race the call against the same signal so the
-// awaiter sees an AbortError rejection, matching the convention used by other
-// patched awaitables. Caller-provided options are otherwise preserved; only
-// `signal` is overridden.
-function patchBotGoto(session) {
-  patchMethod(session, session.bot, "goto", (original) => (goal, options) => {
-    if (session.deadline.signal.aborted) {
-      return Promise.reject(session.deadline.signal.reason);
-    }
-    const merged = { ...(options || {}), signal: session.deadline.signal };
-    const promise = callPromise(original, [goal, merged]);
-    suppressOriginalPromise(promise);
-    return trackPromise(
-      session,
-      raceAbort(session.deadline.signal, promise, null),
-    );
-  });
-}
+// The `bot` value exposed to /eval scripts is built per-request by
+// createBotFacade. The underlying mineflayer bot is shared across requests and
+// is never patched; the facade is the entire eval-visible API surface.
+// Whatever it does not expose is unreachable from eval code, so this list is
+// the contract advertised in system.md.
+//
+// The facade enforces three per-request guarantees:
+//   - Methods reject (or throw) once the request has aborted, so detached
+//     continuations cannot mutate the bot after the script settles.
+//   - Behavior/intent the script introduces (control states, listeners it
+//     adds, opened windows, in-flight goto/follow, activated items, ongoing
+//     dig) is undone via the request's cleanup stack.
+//   - Long-running awaitables race against the abort signal so callers observe
+//     AbortError instead of hanging.
+//
+// Read-only state is passed through directly: the script sees the same objects
+// mineflayer already exposes (entity, inventory, world, registry, etc.).
+// Returned helpers like Window are also passed through; their lifecycle is
+// managed by the cleanup hook the facade installs.
 
-// Patch bot.follow the same way as bot.goto: thread session.deadline.signal so
-// the follow loop terminates with the script and its own clean-up runs.
-function patchBotFollow(session) {
-  patchMethod(session, session.bot, "follow", (original) =>
-    (target, options) => {
-      if (session.deadline.signal.aborted) {
-        return Promise.reject(session.deadline.signal.reason);
+// Build the per-request facade exposed to eval scripts as `bot`.
+function createBotFacade(bot, session) {
+  const { signal } = session.deadline;
+  const { cleanup } = session;
+  const tracked = [];
+
+  cleanup.deferOnce("listeners", () => {
+    for (const { event, listener } of tracked) {
+      bot.removeListener(event, listener);
+    }
+  });
+
+  // Throw if the request has already aborted; used by sync facade methods
+  // and as the entry guard for awaitables.
+  const guard = () => signal.throwIfAborted();
+
+  // Run an underlying bot awaitable raced against the abort signal, with
+  // late library-internal rejections suppressed.
+  const racedAwait = (fn, args, onAbort = null) => {
+    guard();
+    const promise = callPromise(fn, args);
+    suppressOriginalPromise(promise);
+    return trackPromise(session, raceAbort(signal, promise, onAbort));
+  };
+
+  // Wrap a plain bot method as an abort-aware awaitable.
+  const awaitable = (method) => (...args) =>
+    racedAwait((...a) => bot[method](...a), args);
+
+  const trackListener = (event, listener) => {
+    tracked.push({ event, listener });
+  };
+
+  // Open a bot window and auto-close it on cleanup if it's still current.
+  // `target` is a block (containers/furnace/anvil/enchant) or entity (villager).
+  const openWindow = (method) => (target) => {
+    guard();
+    const opening = callPromise((t) => bot[method](t), [target]);
+    suppressOriginalPromise(opening);
+    const opened = opening.then((window) => {
+      if (window) {
+        cleanup.deferOnce(`window:${window.id}`, () => {
+          if (bot.currentWindow === window) bot.closeWindow(window);
+        });
       }
-      const merged = { ...(options || {}), signal: session.deadline.signal };
-      const promise = callPromise(original, [target, merged]);
-      suppressOriginalPromise(promise);
-      return trackPromise(
-        session,
-        raceAbort(session.deadline.signal, promise, null),
+      return window;
+    });
+    return trackPromise(session, raceAbort(signal, opened, null));
+  };
+
+  // Bespoke members keep their cleanup contracts or special wiring inline;
+  // trivial pass-throughs are populated from the lists below.
+  const facade = {
+    setControlState(state, value) {
+      guard();
+      if (value) {
+        cleanup.deferOnce(
+          `control:${state}`,
+          () => bot.setControlState(state, false),
+        );
+      }
+      return bot.setControlState(state, value);
+    },
+    dig(block) {
+      const stop = () => {
+        if (bot.stopDigging) bot.stopDigging();
+      };
+      cleanup.deferOnce("dig", stop);
+      return racedAwait((b) => bot.dig(b), [block], () => {
+        // Native cancellation runs on abort; mark cleanup discharged so the
+        // final finally path does not call stopDigging again.
+        stop();
+        cleanup.markDone("dig");
+      });
+    },
+    activateItem(...args) {
+      guard();
+      cleanup.deferOnce("activateItem", () => {
+        if (bot.deactivateItem) bot.deactivateItem();
+      });
+      return bot.activateItem(...args);
+    },
+    goto(goal, options) {
+      const merged = { ...(options || {}), signal };
+      return racedAwait(
+        (g, o) => pathfinder.goto(bot, g, o),
+        [goal, merged],
       );
+    },
+    follow(target, options) {
+      const merged = { ...(options || {}), signal };
+      return racedAwait(
+        (t, o) => pathfinder.follow(bot, t, o),
+        [target, merged],
+      );
+    },
+
+    // Window-openers auto-close on cleanup (see openWindow).
+    openContainer: openWindow("openContainer"),
+    openFurnace: openWindow("openFurnace"),
+    openAnvil: openWindow("openAnvil"),
+    openEnchantmentTable: openWindow("openEnchantmentTable"),
+    openVillager: openWindow("openVillager"),
+
+    // Listener registration is request-tracked; cleanup removes anything
+    // still attached when the request ends.
+    on(event, listener) {
+      guard();
+      trackListener(event, listener);
+      return bot.on(event, listener);
+    },
+    once(event, listener) {
+      guard();
+      // once() needs explicit tracking too: if it never fires, EventEmitter
+      // will not remove it for us before the request ends.
+      trackListener(event, listener);
+      return bot.once(event, listener);
+    },
+    addListener(event, listener) {
+      guard();
+      trackListener(event, listener);
+      return bot.addListener(event, listener);
+    },
+    removeListener(event, listener) {
+      guard();
+      const idx = tracked.findIndex(
+        (entry) => entry.event === event && entry.listener === listener,
+      );
+      if (idx >= 0) tracked.splice(idx, 1);
+      return bot.removeListener(event, listener);
+    },
+  };
+
+  // Read-only state. Enumerable so Object.keys(bot) lists them in the
+  // unexposed-property error message.
+  for (const name of [
+    "username", "entity", "spawnPoint", "health", "food", "foodSaturation",
+    "experience", "time", "game", "world", "registry", "isSleeping",
+    "isRaining", "thunderState", "inventory", "heldItem", "currentWindow",
+    "usingHeldItem", "quickBarSlot", "targetDigBlock", "players", "entities",
+  ]) {
+    Object.defineProperty(facade, name, {
+      get: () => bot[name],
+      enumerable: true,
+      configurable: true,
     });
-}
+  }
 
-// Patch item activation so held-item use is deactivated.
-function patchItemUse(session) {
-  patchMethod(session, session.bot, "activateItem", (original) => (...args) => {
-    session.cleanup.deferOnce("activateItem", () => {
-      if (session.bot.deactivateItem) session.bot.deactivateItem();
-    });
-    return original(...args);
-  });
-}
-
-// Replace one method through the session patch set when it exists.
-function patchMethod(session, target, method, wrap) {
-  if (!target || typeof target[method] !== "function") return false;
-  session.patches.add(target, method, wrap);
-  return true;
-}
-
-// Wrap an awaitable method with abort racing and promise tracking.
-function patchAwaitable(session, target, method) {
-  patchMethod(session, target, method, (original) => (...args) => {
-    if (session.deadline.signal.aborted) {
-      return Promise.reject(session.deadline.signal.reason);
-    }
-    const promise = callPromise(original, args);
-    suppressOriginalPromise(promise);
-    return trackPromise(
-      session,
-      raceAbort(session.deadline.signal, promise, null),
-    );
-  });
-}
-
-// Wrap an awaitable method that has an explicit cancellation action.
-function patchCancelable(session, target, method, cleanupKey, cancel) {
-  patchMethod(session, target, method, (original) => (...args) => {
-    if (session.deadline.signal.aborted) {
-      return Promise.reject(session.deadline.signal.reason);
-    }
-    session.cleanup.deferOnce(cleanupKey, cancel);
-    const promise = callPromise(original, args);
-    suppressOriginalPromise(promise);
-    const onAbort = () => {
-      // Abort runs native cancellation immediately; mark the cleanup discharged
-      // so the finally path does not repeat the same cancellation.
-      cancel();
-      session.cleanup.markDone(cleanupKey);
+  // Sync pass-throughs (queries, communication, attack, hotbar).
+  for (const name of [
+    "blockAt", "blockAtCursor", "blockAtEntityCursor", "entityAtCursor",
+    "findBlock", "findBlocks", "nearestEntity", "canSeeBlock", "canDigBlock",
+    "digTime", "recipesFor", "recipesAll", "chat", "whisper", "attack",
+    "activateEntity", "setQuickBarSlot", "mount", "dismount", "getControlState",
+    "respawn",
+  ]) {
+    facade[name] = (...args) => {
+      guard();
+      return bot[name](...args);
     };
-    return trackPromise(
-      session,
-      raceAbort(session.deadline.signal, promise, onAbort),
-    );
+  }
+
+  // Abort-aware awaitables.
+  for (const name of [
+    "lookAt", "waitForTicks", "waitForChunksToLoad", "placeBlock",
+    "activateBlock", "equip", "tossStack", "consume", "craft", "transfer",
+    "sleep", "wake",
+  ]) {
+    facade[name] = awaitable(name);
+  }
+
+  // Turn reads of unexposed names into self-documenting errors; symbols
+  // and `then` pass through so engine and Promise internals keep working.
+  return new Proxy(facade, {
+    get(target, property, receiver) {
+      if (typeof property === "symbol"
+        || property === "then"
+        || Reflect.has(target, property)) {
+        return Reflect.get(target, property, receiver);
+      }
+      throw new Error(
+        `bot.${property} is not exposed by this facade. `
+          + `Use Object.keys(bot) to list available members.`,
+      );
+    },
   });
 }
 
@@ -808,21 +746,16 @@ function trackPromise(session, promise) {
   return promise;
 }
 
-// Suppress late rejections from underlying library promises after the request
-// abort race has already settled. raceAbort attaches .then(v, e) to the
-// outermost promise we get back from a mineflayer call, but the libraries
-// build internal .then-chains and event-driven sub-promises we never see;
-// when our cleanup (e.g. bot.stopDigging()) cancels the operation after the
-// wrapper has already rejected with the abort, those library-internal
-// descendants reject with no handler attached. This terminal .catch marks the
-// whole library-managed chain as observed. The wrapper still surfaces real
-// errors to awaited eval code when the underlying operation wins the race.
+// Absorb late library-internal rejections after abort wins the race. When
+// cleanup (e.g. stopDigging) cancels the operation, mineflayer's internal
+// .then-chain rejects with no handler; this terminal .catch silences that.
+// Real errors still surface via raceAbort when the call wins the race.
 function suppressOriginalPromise(promise) {
   promise.catch(() => {});
 }
 
 // ---------------------------------------------------------------------------
-// Cleanup / patch scopes
+// Cleanup / timer scopes
 
 // Create a keyed LIFO cleanup stack for request-scoped undo actions.
 function createCleanupStack() {
@@ -858,29 +791,6 @@ function createCleanupStack() {
         }
       }
       return errors;
-    },
-  };
-}
-
-// Create a method patch set that can restore originals in reverse order.
-function createPatchSet() {
-  const originals = [];
-
-  return {
-    // Patch one method and remember its original implementation.
-    add(target, method, wrap) {
-      const original = target[method];
-      originals.push({ target, method, original });
-      target[method] = wrap(original.bind(target), original);
-    },
-
-    // Restore all patched methods in reverse patch order.
-    restore() {
-      for (let i = originals.length - 1; i >= 0; i--) {
-        const { target, method, original } = originals[i];
-        target[method] = original;
-      }
-      originals.length = 0;
     },
   };
 }
@@ -1158,21 +1068,6 @@ function abortReasonTag(reason) {
 // Detect abort-style errors from local or platform sources.
 function isAbortError(error) {
   return error && (error.name === "AbortError" || error.code === "ABORT_ERR");
-}
-
-// Return a promise that rejects when an AbortSignal aborts.
-function abortPromise(signal) {
-  return new Promise((_, reject) => {
-    if (signal.aborted) {
-      reject(signal.reason);
-      return;
-    }
-    signal.addEventListener(
-      "abort",
-      () => reject(signal.reason),
-      { once: true },
-    );
-  });
 }
 
 // Race a promise against an AbortSignal and optionally cancel on abort.

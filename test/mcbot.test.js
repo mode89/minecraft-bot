@@ -124,11 +124,11 @@ test("user snippets are loaded fresh on each eval", async (t) => {
   const { url } = await createFixture(t, { snippetsPath });
   const initial = await post(
     url,
-    "print('answer', snippets.answer(), 'bot', typeof bot.snippets)",
+    "print('answer', snippets.answer(), 'bot', 'snippets' in bot)",
   );
   assert.deepEqual(initial, {
     status: 200,
-    body: "answer 1 bot undefined\n",
+    body: "answer 1 bot false\n",
   });
 
   await fs.writeFile(
@@ -232,28 +232,35 @@ test("temporary state is cleaned after success and "
   assertClean(bot);
 });
 
+test("unexposed bot members produce a self-documenting error", async (t) => {
+  const { url } = await createFixture(t);
+
+  const response = await post(url, "print(bot.notARealMethod)");
+  assert.equal(response.status, 500);
+  const payload = JSON.parse(response.body);
+  assert.match(payload.error, /bot\.notARealMethod is not exposed/);
+  assert.match(payload.error, /Object\.keys\(bot\)/);
+});
+
 test("once listeners that never fire are removed", async (t) => {
   const { bot, url } = await createFixture(t);
 
-  const response = await post(url, `
-    bot.once('rain', () => {})
-    print('rain-in-request', bot.listenerCount('rain'))
-  `);
+  const response = await post(url, "bot.once('rain', () => {}); print('ok')");
 
-  assert.deepEqual(response, { status: 200, body: "rain-in-request 1\n" });
+  assert.deepEqual(response, { status: 200, body: "ok\n" });
   assert.equal(bot.listenerCount("rain"), 0);
 });
 
 test("large listener batches are cleaned", async (t) => {
   const { bot, url } = await createFixture(t);
 
-  const response = await post(url, `
-    for (let i = 0; i < 190; i++) bot.on('physicTick', () => {})
-    print('count', bot.listenerCount('physicTick'))
-  `);
+  const response = await post(
+    url,
+    "for (let i = 0; i < 190; i++) bot.on('physicTick', () => {}); print('ok')",
+  );
 
   assert.equal(response.status, 200);
-  assert.equal(response.body, "count 191\n");
+  assert.equal(response.body, "ok\n");
   assert.equal(bot.listenerCount("physicTick"), 1);
 });
 
@@ -293,15 +300,11 @@ test("client disconnect aborts the request, cleans up, and "
   await delay(5);
 
   const queuedStarted = Date.now();
-  const queued = await post(url, `
-    print('queued-ran')
-    print('jump', !!bot.controlState.jump)
-    print('physicTick', bot.listenerCount('physicTick'))
-  `);
+  const queued = await post(url, "print('queued-ran')");
 
   await abandoned;
   assert.equal(queued.status, 200);
-  assert.equal(queued.body, "queued-ran\njump false\nphysicTick 1\n");
+  assert.equal(queued.body, "queued-ran\n");
   assert(
     Date.now() - queuedStarted < 500,
     "queue should not wait for the full deadline",
@@ -368,19 +371,18 @@ test("client disconnect suppresses nested dig abort rejections", async (t) => {
   }
 });
 
-test("fire-and-forget bot.goto is aborted and cleaned", async (t) => {
+test("fire-and-forget awaitables are aborted and cleaned", async (t) => {
   const { bot, url } = await createFixture(t);
 
   const response = await post(url, `
-    bot.goto({ x: 5, y: 64, z: 5 })
+    bot.dig({ name: 'test_block' })
     print('started')
   `);
 
   assert.deepEqual(response, { status: 200, body: "started\n" });
-  // The fake goto sets forward while running and clears it in its finally on
-  // abort; assert the cleanup ran.
-  assert.equal(!!bot.controlState.forward, false);
-  assert.equal(bot.gotoAborted, true);
+  // dig hangs forever in the fake; cleanup must call stopDigging on script
+  // end so the underlying intent is released.
+  assert.equal(bot.diggingStopped, true);
 });
 
 test("open windows and activated items are cleaned", async (t) => {
@@ -428,13 +430,11 @@ test("dig is natively cancelled on deadline", async (t) => {
   assertClean(bot);
 });
 
-test("patched inventory and block awaitables still resolve", async (t) => {
+test("facade inventory and block awaitables still resolve", async (t) => {
   const { bot, url } = await createFixture(t);
 
   const response = await post(url, `
     await bot.equip({ name: 'stick' }, 'hand')
-    await bot.unequip('hand')
-    await bot.toss(1, null, 1)
     await bot.tossStack({ name: 'dirt' })
     await bot.consume()
     await bot.craft({ name: 'planks' }, 1, null)
@@ -446,8 +446,6 @@ test("patched inventory and block awaitables still resolve", async (t) => {
   assert.deepEqual(response, { status: 200, body: "done\n" });
   assert.deepEqual(bot.calls.map((call) => call.name), [
     "equip",
-    "unequip",
-    "toss",
     "tossStack",
     "consume",
     "craft",
@@ -584,27 +582,6 @@ function createFakeBot() {
   bot.openChest = bot.openContainer;
   bot.closeWindow = (window) => {
     if (bot.currentWindow === window) bot.currentWindow = null;
-  };
-
-  bot.gotoAborted = false;
-  bot.goto = async (goal, options = {}) => {
-    bot.lastGoal = goal;
-    bot.setControlState("forward", true);
-    try {
-      await new Promise((resolve) => {
-        const signal = options.signal;
-        if (!signal) return; // Hangs forever without a signal; tests pass one.
-        if (signal.aborted) { resolve(); return; }
-        signal.addEventListener("abort", () => resolve(), { once: true });
-      });
-      bot.gotoAborted = true;
-      if (options.signal && options.signal.aborted) {
-        throw options.signal.reason;
-      }
-      return { status: "arrived" };
-    } finally {
-      bot.setControlState("forward", false);
-    }
   };
 
   bot.on("physicTick", () => {});
