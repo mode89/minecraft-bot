@@ -25,6 +25,15 @@ This is the operator prompt injected into Pi's system prompt while the managed r
 
 Keep it user-facing and concise.
 
+## Tests
+
+Tests live under `test/` and are runnable with `node --test`.
+
+End-to-end tests under `test/integration` that boot a real Minecraft server and a real `mcbot.js`:
+- `fixture.js` exposes `withWorld(map, spawn, body)`, which builds a synthetic block map, spawns a fresh bot, and runs eval requests against it.
+- Tests are gated on `INTEGRATION_TESTS=1` so the default `node --test` run skips them.
+- `minecraft-server` must be on `PATH` for the fixture to boot.
+
 ## Postinstall patches `scripts/patches.js`
 
 Runs as `npm` `postinstall` to patch files under `node_modules/`:

@@ -64,6 +64,12 @@ If the file is missing, `snippets` is an empty object. If it exists but fails to
 node --test
 ```
 
+Integration tests boot a real Minecraft server and are skipped by default. To run them, ensure `minecraft-server` is on `PATH` and set `INTEGRATION_TESTS=1`:
+
+```sh
+INTEGRATION_TESTS=1 node --test test/integration/
+```
+
 ## Security
 
 The managed bot runtime executes arbitrary JavaScript received over HTTP. Keep `--http` bound to localhost unless you fully trust the network. Game/world changes made by scripts are real and are not rolled back.

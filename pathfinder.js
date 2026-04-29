@@ -195,7 +195,9 @@ async function walkToWaypoint(bot, target, { stopWhen = () => false } = {}) {
     // already passed in X/Z (which whips lookAt around mid-fall).
     const dist = Math.hypot(tx - pos.x, tz - pos.z);
 
-    if (dist < 0.3) return;
+    // Vertical check too: on a step-down the bot crosses the horizontal
+    // cutoff while still partly supported by the higher block.
+    if (dist < 0.3 && Math.abs(pos.y - target.y) < 0.5) return;
 
     if (dist < bestDistance - 0.01) {
       bestDistance = dist;

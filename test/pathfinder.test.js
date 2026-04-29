@@ -2,9 +2,8 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 
 const {
-  createMinHeap, astar, planPath, goto, follow, GotoError,
+  createMinHeap, astar, planPath,
 } = require("../pathfinder.js");
-const { createFakeBot, simulate } = require("./fake-bot.js");
 
 test("empty heap returns undefined and reports size 0", () => {
   const heap = createMinHeap();
@@ -423,7 +422,7 @@ test("planPath returns exhausted when the goal is enclosed", () => {
   for (const [x, z] of [[0, 1], [2, 1], [1, 0], [1, 2]]) {
     map[z][x] = [1, 1, 1, 1];
   }
-  const bot = createFakeBot(map, { spawn: { x: 0.5, y: 1, z: 0.5 } });
+  const bot = createFakeBot(map);
 
   const result = planPath(
     bot,
@@ -444,159 +443,6 @@ test("planPath treats off-map cells as blocked", () => {
   );
 
   assert.equal(result.status, "exhausted");
-});
-
-// ---------------------------------------------------------------------------
-// goto
-
-test("goto walks a straight path on flat ground", async () => {
-  const bot = createFakeBot(flatMap(5, 5));
-  const result = await simulate(bot, goto(bot, { x: 4, y: 1, z: 0 }));
-
-  assert.equal(result, undefined);
-  assert.equal(Math.floor(bot.entity.position.x), 4);
-  assert.equal(Math.floor(bot.entity.position.z), 0);
-  // All movement controls released after arrival.
-  assert.equal(bot.controlState.forward, false);
-  assert.equal(bot.controlState.jump, false);
-});
-
-test("goto climbs a single step-up", async () => {
-  const map = [[[1], [1, 1]]];
-  const bot = createFakeBot(map);
-  await simulate(bot, goto(bot, { x: 1, y: 2, z: 0 }));
-
-  assert.equal(Math.floor(bot.entity.position.x), 1);
-  assert.equal(Math.floor(bot.entity.position.y), 2);
-});
-
-test("goto drops down a step within the limit", async () => {
-  const map = [[[1, 1, 1], [1]]];
-  const bot = createFakeBot(map);
-  await simulate(bot, goto(bot, { x: 1, y: 1, z: 0 }));
-
-  assert.equal(Math.floor(bot.entity.position.x), 1);
-  assert.equal(Math.floor(bot.entity.position.y), 1);
-});
-
-test("goto throws GotoError(stuck) when a block is placed on the path mid-walk",
-  async () => {
-    const bot = createFakeBot(flatMap(6, 1));
-    let placed = false;
-    bot.on("physicsTick", () => {
-      // Once the bot has moved past x=1.5, drop a wall at x=3 so the next
-      // waypoint becomes unstandable. Without re-validation, the walker
-      // would only notice via the 40-tick stuck timer.
-      if (!placed && bot.entity.position.x > 1.5) {
-        placed = true;
-        bot.setBlock({ x: 3, y: 1, z: 0 }, 1);
-      }
-    });
-
-    await assert.rejects(
-      simulate(bot, goto(bot, { x: 5, y: 1, z: 0 })),
-      (error) => {
-        assert.ok(error instanceof GotoError);
-        assert.equal(error.status, "stuck");
-        // closest = where the bot actually stopped, distance = remaining gap.
-        assert.ok(error.closest.x < 3, `closest.x=${error.closest.x}`);
-        assert.ok(error.distance > 0);
-        return true;
-      },
-    );
-    // Bot stopped before walking into the new wall.
-    assert.ok(bot.entity.position.x < 3, `x=${bot.entity.position.x}`);
-    assert.equal(bot.controlState.forward, false);
-  });
-
-test("goto throws GotoError(unreachable) when no route exists", async () => {
-  // 3x3 floor surrounded by void; goal is far outside the island.
-  const bot = createFakeBot(flatMap(3, 3));
-  await assert.rejects(
-    simulate(bot, goto(bot, { x: 9, y: 1, z: 9 })),
-    (error) => {
-      assert.ok(error instanceof GotoError);
-      assert.equal(error.status, "unreachable");
-      // Closest reachable is the island's far corner (2, 1, 2).
-      assert.deepEqual(error.closest, { x: 2, y: 1, z: 2 });
-      const expected = Math.hypot(9 - 2, 1 - 1, 9 - 2);
-      assert.ok(Math.abs(error.distance - expected) < 1e-9);
-      return true;
-    },
-  );
-});
-
-test("goto accepts a distance function as the goal", async () => {
-  // Target the corner block at (4, 1, 0) by Euclidean distance from the
-  // bot's standing position. Anything within 0.5 of the target counts as
-  // arrived, which on integer coordinates picks out exactly that block.
-  const bot = createFakeBot(flatMap(5, 1));
-  const distanceTo = ({ x, y, z }) =>
-    Math.hypot(x - 4, y - 1, z - 0);
-  await simulate(bot, goto(bot, distanceTo));
-
-  assert.equal(Math.floor(bot.entity.position.x), 4);
-  assert.equal(Math.floor(bot.entity.position.z), 0);
-});
-
-test("goto throws GotoError(limit) when maxNodes is exceeded", async () => {
-  const bot = createFakeBot(flatMap(10, 10));
-  await assert.rejects(
-    simulate(bot, goto(bot, { x: 9, y: 1, z: 9 }, { maxNodes: 2 })),
-    (error) => error instanceof GotoError && error.status === "limit",
-  );
-});
-
-test("goto returns cleanly when stopWhen is true at entry", async () => {
-  const bot = createFakeBot(flatMap(5, 5));
-  const result = await simulate(bot, goto(bot, { x: 4, y: 1, z: 0 }, {
-    stopWhen: () => true,
-  }));
-
-  assert.equal(result, undefined);
-  // Bot did not move from spawn.
-  assert.equal(bot.entity.position.x, 0.5);
-  assert.equal(bot.entity.position.z, 0.5);
-});
-
-test("goto returns cleanly when stopWhen becomes true mid-walk", async () => {
-  const bot = createFakeBot(flatMap(10, 5));
-  const result = await simulate(bot, goto(bot, { x: 9, y: 1, z: 0 }, {
-    stopWhen: () => bot.entity.position.x > 3,
-  }));
-
-  assert.equal(result, undefined);
-  // Bot stopped between the trigger point and the goal.
-  assert.ok(bot.entity.position.x > 3);
-  assert.ok(bot.entity.position.x < 9);
-  // All movement controls released.
-  assert.equal(bot.controlState.forward, false);
-  assert.equal(bot.controlState.jump, false);
-});
-
-test("follow returns when stopWhen is true at entry", async () => {
-  const bot = createFakeBot(flatMap(5, 5));
-  const distanceFn = (pos) => Math.hypot(pos.x - 4, pos.z);
-  await simulate(bot, follow(bot, distanceFn, { stopWhen: () => true }));
-
-  // Bot did not move from spawn.
-  assert.equal(bot.entity.position.x, 0.5);
-  assert.equal(bot.entity.position.z, 0.5);
-});
-
-test("goto rejects on bad arguments", async () => {
-  // goto is async, so argument errors surface as promise rejections rather
-  // than synchronous throws.
-  const bot = createFakeBot(flatMap(3, 3));
-  await assert.rejects(
-    () => goto(null, { x: 0, y: 1, z: 0 }),
-    TypeError,
-  );
-  await assert.rejects(() => goto(bot, null), TypeError);
-  await assert.rejects(
-    () => goto(bot, { x: "oops", y: 1, z: 0 }),
-    TypeError,
-  );
 });
 
 // ---------------------------------------------------------------------------
@@ -634,6 +480,33 @@ function scriptedOps(count, seed) {
     }
   }
   return ops;
+}
+
+// Minimal fake bot for planPath: exposes blockAt over a synthetic map.
+// map[z][x] is either an integer N (shorthand for [N]) or a column array
+// [a, b, ...] placing block-id a at y=0, b at y=1, .... 0 is air, 1 is
+// stone. y<0 is air; out-of-bounds (x, z) returns null so planPath treats
+// it as blocked.
+function createFakeBot(map) {
+  const AIR = { name: "air", boundingBox: "empty" };
+  const STONE = { name: "stone", boundingBox: "block" };
+  const blocks = [AIR, STONE];
+  const grid = map.map((row) => row.map((cell) => (
+    typeof cell === "number" ? [cell] : cell.slice()
+  )));
+  return {
+    blockAt(pos) {
+      const x = Math.floor(pos.x);
+      const y = Math.floor(pos.y);
+      const z = Math.floor(pos.z);
+      if (z < 0 || z >= grid.length) return null;
+      const row = grid[z];
+      if (x < 0 || x >= row.length) return null;
+      if (y < 0) return AIR;
+      const col = row[x];
+      return blocks[y < col.length ? col[y] : 0];
+    },
+  };
 }
 
 // Build a flat fake-bot map: a width x depth grid of single solid floor blocks
