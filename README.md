@@ -24,6 +24,8 @@ Commands:
 
 Once the runtime is started, you can operate the bot either through Pi chat or through normal Minecraft chat. Minecraft chat messages from other players are forwarded into Pi as user messages.
 
+In Minecraft chat, the token `@aim` is replaced with the `(x, y, z)` of the block you are currently looking at, so you can say things like `mine @aim` or `place a torch on @aim`.
+
 Example:
 
 ```text

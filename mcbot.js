@@ -946,10 +946,16 @@ function createChatBroadcaster(bot) {
   bot.on("chat", (username, message, translate, jsonMsg, matches) => {
     if (username === bot.username) return;
 
+    const expanded = expandAimRefs(bot, username, message);
+    if (expanded === null) {
+      bot.whisper(username, "@aim: no block in sight");
+      return;
+    }
+
     const event = {
       type: "chat",
       username,
-      message,
+      message: expanded,
       timestamp: new Date().toISOString(),
     };
     if (translate !== undefined) event.translate = translate;
@@ -988,6 +994,17 @@ function addChatClient(chat, res) {
     clearInterval(heartbeat);
     chat.clients.delete(res);
   });
+}
+
+// Replace `@aim` with the (x, y, z) the speaker is looking at. Returns the
+// message unchanged when `@aim` is absent, or null when it can't be resolved.
+function expandAimRefs(bot, username, message) {
+  if (typeof message !== "string" || !message.includes("@aim")) return message;
+  const entity = bot.players?.[username]?.entity;
+  const block = entity && bot.blockAtEntityCursor(entity, 64);
+  if (!block?.position) return null;
+  const { x, y, z } = block.position;
+  return message.split("@aim").join(`(${x}, ${y}, ${z})`);
 }
 
 // Send one chat event as NDJSON to all live listeners.

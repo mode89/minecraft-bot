@@ -104,6 +104,48 @@ test("/listen filters out the bot's own chat messages", async (t) => {
   controller.abort();
 });
 
+test("/listen expands @aim to the block the player is looking at", async (t) => {
+  const { bot, listenUrl } = await createFixture(t);
+  const controller = new AbortController();
+
+  bot.players = { Steve: { entity: { username: "Steve" } } };
+  bot.blockAtEntityCursor = (entity) => entity === bot.players.Steve.entity
+    ? { position: { x: 10, y: 64, z: 5 } }
+    : null;
+
+  const response = await fetch(listenUrl, { signal: controller.signal });
+  const next = readNextLine(response.body.getReader());
+  bot.emit("chat", "Steve", "go to @aim and mine @aim");
+
+  const event = JSON.parse(await next);
+  assert.equal(event.message, "go to (10, 64, 5) and mine (10, 64, 5)");
+
+  controller.abort();
+});
+
+test("/listen suppresses unresolved @aim and whispers back", async (t) => {
+  const { bot, listenUrl } = await createFixture(t);
+  const controller = new AbortController();
+
+  // bot.players / bot.world unset: aim cannot be resolved.
+  const response = await fetch(listenUrl, { signal: controller.signal });
+  const next = readNextLine(response.body.getReader());
+
+  bot.emit("chat", "Steve", "head to @aim");
+  bot.emit("chat", "Steve", "hello world");
+
+  // The unresolved @aim message is dropped; the next plain message is
+  // delivered, proving the broadcaster did not forward the @aim event.
+  const event = JSON.parse(await next);
+  assert.equal(event.message, "hello world");
+  assert.deepEqual(
+    bot.calls.filter((call) => call.name === "whisper"),
+    [{ name: "whisper", args: ["Steve", "@aim: no block in sight"] }],
+  );
+
+  controller.abort();
+});
+
 test("empty and unicode bodies are handled", async (t) => {
   const { url } = await createFixture(t);
 
@@ -558,6 +600,8 @@ function createFakeBot() {
   const record = (name) => async (...args) => {
     bot.calls.push({ name, args });
   };
+
+  bot.whisper = (...args) => { bot.calls.push({ name: "whisper", args }); };
 
   bot.equip = record("equip");
   bot.unequip = record("unequip");
