@@ -237,7 +237,7 @@ test("withTimeout rejects locally and raw timers are blocked", async (t) => {
 });
 
 test("server deadline aborts sleep and cleans temporary state", async (t) => {
-  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 30 });
+  const { bot, url } = await createFixture(t, { requestTimeoutMs: 30 });
 
   const response = await post(url, `
     bot.setControlState('jump', true)
@@ -332,7 +332,7 @@ test("requests are serialized", async (t) => {
 
 test("client disconnect aborts the request, cleans up, and "
   + "releases the queue", async (t) => {
-  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 1000 });
+  const { bot, url } = await createFixture(t, { requestTimeoutMs: 1000 });
 
   const abandoned = abandonPost(url, `
     bot.setControlState('jump', true)
@@ -355,7 +355,7 @@ test("client disconnect aborts the request, cleans up, and "
 });
 
 test("client disconnect does not leak helper promise abort rejections", async (t) => {
-  const { url } = await createFixture(t, { defaultTimeoutMs: 1000 });
+  const { url } = await createFixture(t, { requestTimeoutMs: 1000 });
   const observed = observeUnhandledRejection();
 
   try {
@@ -375,7 +375,7 @@ test("client disconnect does not leak helper promise abort rejections", async (t
 });
 
 test("detached eval continuation cannot mutate bot after abort", async (t) => {
-  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 1000 });
+  const { bot, url } = await createFixture(t, { requestTimeoutMs: 1000 });
 
   await abandonPost(url, `
     const setControlState = bot.setControlState
@@ -393,7 +393,7 @@ test("detached eval continuation cannot mutate bot after abort", async (t) => {
 });
 
 test("client disconnect suppresses nested dig abort rejections", async (t) => {
-  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 1000 });
+  const { bot, url } = await createFixture(t, { requestTimeoutMs: 1000 });
   bot.lookAt = () => new Promise(() => {});
   bot.dig = async () => {
     await bot.lookAt({ x: 1, y: 2, z: 3 });
@@ -444,7 +444,7 @@ test("open windows and activated items are cleaned", async (t) => {
 });
 
 test("lookAt abort recovery", async (t) => {
-  const { url } = await createFixture(t, { defaultTimeoutMs: 1000 });
+  const { url } = await createFixture(t, { requestTimeoutMs: 1000 });
 
   await abandonPost(url, `
     for (let i = 0; i < 1000; i++) {
@@ -462,7 +462,7 @@ test("lookAt abort recovery", async (t) => {
 });
 
 test("dig is natively cancelled on deadline", async (t) => {
-  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 30 });
+  const { bot, url } = await createFixture(t, { requestTimeoutMs: 30 });
 
   const response = await post(url, "await bot.dig({ name: 'test_block' })");
 
@@ -499,7 +499,7 @@ test("facade inventory and block awaitables still resolve", async (t) => {
 
 test("non-cancelable awaitables reject on deadline "
   + "without poisoning later requests", async (t) => {
-  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 30 });
+  const { bot, url } = await createFixture(t, { requestTimeoutMs: 30 });
   bot.equip = () => {
     bot.calls.push({ name: "equip" });
     return new Promise(() => {});
@@ -530,7 +530,7 @@ test("many short evals in sequence do not leak state", async (t) => {
 });
 
 test("near-deadline completions are clean 200s or clean 504s", async (t) => {
-  const { bot, url } = await createFixture(t, { defaultTimeoutMs: 25 });
+  const { bot, url } = await createFixture(t, { requestTimeoutMs: 25 });
 
   for (let i = 0; i < 20; i++) {
     const ms = i % 2 === 0 ? 20 : 30;
@@ -566,7 +566,7 @@ test("repeated cleanup after errors does not leak state", async (t) => {
 async function createFixture(t, config = {}) {
   const bot = createFakeBot();
   const server = createServer(bot, {
-    defaultTimeoutMs: config.defaultTimeoutMs ?? 500,
+    requestTimeoutMs: config.requestTimeoutMs ?? 500,
     snippetsPath: config.snippetsPath,
   });
 

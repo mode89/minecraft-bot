@@ -9,7 +9,10 @@
 //
 // POST any JS source to http://<http>/eval and it will be evaluated in an
 // async function with `bot`, `snippets`, `Vec3`, `print`, `sleep`,
-// `withTimeout`, and `abort` (an AbortSignal) in scope. `bot` is a curated
+// `withTimeout`, and `abort` (an AbortSignal) in scope. The timer globals
+// (`setTimeout`, `setInterval`, `setImmediate` and their clear counterparts)
+// are replaced by versions that throw; scripts use `sleep`/`withTimeout`
+// instead. `bot` is a curated
 // per-request facade over the mineflayer bot (see createBotFacade); the
 // underlying mineflayer bot is shared across requests and never mutated.
 // Before each eval, exports from .pi/minecraft/snippets.js in the current
@@ -42,6 +45,16 @@ const util = require("util");
 // ---------------------------------------------------------------------------
 // Main / CLI
 
+// Command-line options: name -> [description, default value].
+const CLI_OPTIONS = {
+  server: ["Minecraft server address", "localhost:25565"],
+  user: ["Bot username", "mcbot"],
+  http: ["HTTP server bind address", "localhost:3000"],
+  timeout: ["Per-request deadline in milliseconds", "120000"],
+};
+
+const USAGE = formatUsage();
+
 // Start the bot runtime from command-line arguments.
 function main() {
   let config;
@@ -49,16 +62,16 @@ function main() {
     config = parseConfig(process.argv);
   } catch (error) {
     console.error(`error: ${error.message}`);
+    console.error(USAGE);
     process.exit(2);
   }
 
   const bot = createMinecraftBot(config);
-  const runtime = createRuntime(bot, config);
-  const server = createHttpServer(runtime);
+  const server = createServer(bot, config);
 
-  server.listen(config.httpPort, config.httpHost, () => {
+  server.listen(config.http.port, config.http.host, () => {
     console.log(
-      `[http] listening on http://${config.httpHost}:${config.httpPort} `
+      `[http] listening on http://${config.http.host}:${config.http.port} `
         + `(/eval, /listen)`,
     );
   });
@@ -66,103 +79,56 @@ function main() {
 
 // Convert raw process arguments into normalized runtime configuration.
 function parseConfig(argv) {
-  const args = parseArgs(argv, "Usage: node mcbot.js [options]", {
-    server: ["Minecraft server address", "localhost:25565"],
-    user: ["Bot username", "mcbot"],
-    http: ["HTTP server bind address", "localhost:3000"],
-    timeout: ["Per-request deadline", "120000"],
-  });
-
-  const [mcHost, mcPort] = parseHostPort(args.server);
-  const [httpHost, httpPort] = parseHostPort(args.http);
-  const defaultTimeoutMs = parsePositiveInteger(args.timeout, "--timeout");
+  const args = parseArgs(argv);
 
   return {
-    mcHost,
-    mcPort,
-    mcUsername: args.user,
-    httpHost,
-    httpPort,
-    defaultTimeoutMs,
+    minecraft: parseHostPort(args.server),
+    username: args.user,
+    http: parseHostPort(args.http),
+    requestTimeoutMs: parsePositiveInteger(args.timeout, "--timeout"),
   };
 }
 
-// Parse string-only --name value arguments from definition metadata.
-function parseArgs(argv, epilog, definitions) {
+// Parse `--name value` and `--name=value` options into a name -> string map.
+// Malformed input throws; `--help` prints usage and exits.
+function parseArgs(argv) {
+  const values = Object.fromEntries(
+    Object.entries(CLI_OPTIONS).map(([name, [, fallback]]) => [name, fallback]),
+  );
   const args = argv.slice(2);
-  const usage = formatUsage(epilog, definitions);
-  const values = {};
-  const requiredNames = [];
-
-  for (const [name, definition] of Object.entries(definitions)) {
-    if (!/^[a-z][a-z0-9-]*$/.test(name)) {
-      throw new Error(`invalid argument name: ${name}`);
-    }
-    if (!Array.isArray(definition) || definition.length < 1
-      || definition.length > 2) {
-      throw new Error(`invalid definition for --${name}`);
-    }
-    if (typeof definition[0] !== "string") {
-      throw new Error(`invalid description for --${name}`);
-    }
-    if (definition.length === 1) {
-      requiredNames.push(name);
-      continue;
-    }
-    if (typeof definition[1] !== "string") {
-      throw new Error(`invalid default for --${name}`);
-    }
-    values[name] = definition[1];
-  }
-
-  const fail = (message) => {
-    console.error(`error: ${message}`);
-    console.error(usage);
-    process.exit(2);
-  };
 
   for (let i = 0; i < args.length; i++) {
     const token = args[i];
 
     if (token === "--help") {
-      console.log(usage);
+      console.log(USAGE);
       process.exit(0);
     }
 
-    if (!token.startsWith("--")) {
-      fail(`unexpected argument "${token}"`);
-    }
-
     const eq = token.indexOf("=");
-    const name = token.slice(2, eq < 0 ? undefined : eq);
-    if (!name) fail("empty argument name");
-    if (!Object.hasOwn(definitions, name)) fail(`unknown argument --${name}`);
+    const name = token.startsWith("--")
+      ? token.slice(2, eq < 0 ? undefined : eq)
+      : "";
+    if (!Object.hasOwn(CLI_OPTIONS, name)) {
+      throw new Error(`unknown argument "${token}"`);
+    }
 
     const value = eq >= 0 ? token.slice(eq + 1) : args[++i];
     if (value === undefined || (eq < 0 && value.startsWith("--"))) {
-      fail(`missing value for --${name}`);
+      throw new Error(`missing value for --${name}`);
     }
 
     values[name] = value;
   }
 
-  for (const name of requiredNames) {
-    if (!Object.hasOwn(values, name))
-      fail(`missing required argument --${name}`);
-  }
-
   return values;
 }
 
-// Build the command-line usage text from argument definitions.
-function formatUsage(epilog, definitions) {
+// Build the command-line usage text from CLI_OPTIONS.
+function formatUsage() {
   const rows = [
-    ...Object.entries(definitions).map(([name, definition]) => {
-      const suffix = definition.length === 2
-        ? ` (default: ${definition[1]})`
-        : " (required)";
-      return [`--${name} <value>`, `${definition[0]}${suffix}`];
-    }),
+    ...Object.entries(CLI_OPTIONS).map(([name, [description, fallback]]) =>
+      [`--${name} <value>`, `${description} (default: ${fallback})`]),
     ["--help", "Show this help"],
   ];
 
@@ -171,10 +137,10 @@ function formatUsage(epilog, definitions) {
     .map(([option, description]) => `  ${option.padEnd(width)}  ${description}`)
     .join("\n");
 
-  return `${epilog}\n\nOptions:\n${options}\n`;
+  return `Usage: node mcbot.js [options]\n\nOptions:\n${options}\n`;
 }
 
-// Split a host:port string into host and numeric port.
+// Split a host:port string into a host and a numeric port.
 function parseHostPort(value) {
   const idx = value.lastIndexOf(":");
   if (idx < 0) throw new Error(`expected host:port, got "${value}"`);
@@ -184,7 +150,7 @@ function parseHostPort(value) {
   if (!host || !Number.isFinite(port)) {
     throw new Error(`invalid host:port "${value}"`);
   }
-  return [host, port];
+  return { host, port };
 }
 
 // Parse and validate a positive integer command-line value.
@@ -202,9 +168,9 @@ function parsePositiveInteger(value, label) {
 // Create and initialize the Mineflayer bot instance.
 function createMinecraftBot(config) {
   const bot = mineflayer.createBot({
-    host: config.mcHost,
-    port: config.mcPort,
-    username: config.mcUsername,
+    host: config.minecraft.host,
+    port: config.minecraft.port,
+    username: config.username,
     auth: "offline",
   });
 
@@ -212,42 +178,37 @@ function createMinecraftBot(config) {
   // request cleanup, so the EventEmitter default of 10 only creates noise.
   bot.setMaxListeners(200);
 
-  installBotLogging(bot);
+  installBotLifecycleHandlers(bot);
   return bot;
 }
 
-// Register process-level logging for bot lifecycle events.
-function installBotLogging(bot) {
+// Log bot lifecycle events and end the process when the connection drops.
+function installBotLifecycleHandlers(bot) {
   bot.on("login", () => console.log(`[bot] logged in as ${bot.username}`));
   bot.on("spawn", () => console.log("[bot] spawned"));
   bot.on("kicked", (reason) => console.log(`[bot] kicked: ${reason}`));
   bot.on("error", (error) => console.log(`[bot] error: ${error.message}`));
   bot.on("end", (reason) => {
     console.log(`[bot] disconnected: ${reason}`);
+    // No reconnect policy: the supervising process restarts the runtime.
     process.exit(0);
   });
-}
-
-// Bundle long-lived bot, config, queue, and chat state.
-function createRuntime(bot, config) {
-  return {
-    bot,
-    config,
-    evalQueue: createMutex(),
-    chat: createChatBroadcaster(bot),
-  };
-}
-
-// Public factory for the HTTP control server around an existing bot.
-function createServer(bot, config) {
-  return createHttpServer(createRuntime(bot, config));
 }
 
 // ---------------------------------------------------------------------------
 // HTTP server
 
-// Create the HTTP server and protect the request router from uncaught errors.
-function createHttpServer(runtime) {
+// Create the HTTP control server around an existing bot. The runtime holds the
+// long-lived state shared by every request; the router protects it from
+// uncaught errors.
+function createServer(bot, config) {
+  const runtime = {
+    bot,
+    config,
+    evalQueue: createSerialQueue(),
+    chat: createChatBroadcaster(bot),
+  };
+
   return http.createServer((req, res) => {
     routeRequest(runtime, req, res).catch((error) => {
       writeResponse(
@@ -265,7 +226,7 @@ async function routeRequest(runtime, req, res) {
   const pathname = getPathname(req);
 
   if (req.method === "GET" && pathname === "/listen") {
-    handleListenRequest(runtime, req, res);
+    runtime.chat.addClient(res);
     return;
   }
 
@@ -279,7 +240,7 @@ async function routeRequest(runtime, req, res) {
 
 // Extract a request pathname without depending on an external host.
 function getPathname(req) {
-  if (!req.url) return req.url;
+  if (!req.url) return "";
   return new URL(req.url, "http://localhost").pathname;
 }
 
@@ -293,28 +254,22 @@ async function handleEvalRequest(runtime, req, res) {
     return;
   }
 
-  await runtime.evalQueue(() => runEvalSession(runtime, req, res, code));
-}
-
-// Attach an HTTP response as a streaming chat listener.
-function handleListenRequest(runtime, _req, res) {
-  addChatClient(runtime.chat, res);
+  await runtime.evalQueue(() => runEvalSession(runtime, res, code));
 }
 
 // ---------------------------------------------------------------------------
 // Eval session
 
 // Run one complete /eval request lifecycle.
-async function runEvalSession(runtime, req, res, code) {
-  const session = createEvalSession(runtime, req, res);
+async function runEvalSession(runtime, res, code) {
+  const session = createEvalSession(runtime, res);
   let scriptError = null;
-  let cleanupErrors = [];
+  let cleanupErrors;
 
   try {
     await raceAbort(
       session.deadline.signal,
-      executeUserCode(buildEvalContext(session), code),
-      null,
+      executeUserCode(buildEvalBindings(session), code),
     );
   } catch (error) {
     scriptError = error;
@@ -326,20 +281,11 @@ async function runEvalSession(runtime, req, res, code) {
 }
 
 // Create all request-scoped state used by an eval session.
-function createEvalSession(runtime, req, res) {
-  const controller = new AbortController();
-  const { signal } = controller;
-  const output = [];
-  const timeoutId = setTimeout(() => {
-    if (!signal.aborted) controller.abort(makeAbortError("deadline"));
-  }, runtime.config.defaultTimeoutMs);
-
-  if (typeof timeoutId.unref === "function") timeoutId.unref();
+function createEvalSession(runtime, res) {
+  const deadline = createDeadline(runtime.config.requestTimeoutMs);
 
   const onClose = () => {
-    if (!res.writableEnded && !signal.aborted) {
-      controller.abort(makeAbortError("client-disconnect"));
-    }
+    if (!res.writableEnded) deadline.abort("client-disconnect");
   };
   // Listen on res, not req: after the body is drained, req.close is not a
   // reliable client-disconnect signal, but res.close still follows the socket.
@@ -350,22 +296,38 @@ function createEvalSession(runtime, req, res) {
   cleanup.deferOnce("timers", timers.clearAll);
 
   return {
-    runtime,
     bot: runtime.bot,
     config: runtime.config,
-    req,
     res,
-    deadline: { controller, signal, timeoutId },
+    deadline,
     onClose,
-    output,
+    output: [],
     cleanup,
     timers,
     pendingPromises: new Set(),
   };
 }
 
-// Build the sandbox-visible bindings for user code.
-function buildEvalContext(session) {
+// Create the request deadline: the signal request work races against, the way
+// to trip it with a machine-readable reason, and the per-request timer.
+function createDeadline(timeoutMs) {
+  const controller = new AbortController();
+  const { signal } = controller;
+
+  const abort = (reason) => {
+    if (!signal.aborted) controller.abort(makeAbortError(reason));
+  };
+
+  const timeoutId = setTimeout(() => abort("deadline"), timeoutMs);
+  if (typeof timeoutId.unref === "function") timeoutId.unref();
+
+  return { signal, abort, stopTimer: () => clearTimeout(timeoutId) };
+}
+
+// Build the bindings user code sees as its scope. Their names are the /eval
+// API surface; executeUserCode derives both parameters and arguments from
+// this one object, so the list is written down once.
+function buildEvalBindings(session) {
   return {
     bot: createBotFacade(session.bot, session),
     snippets: loadSnippets(getSnippetsPath(session.config)),
@@ -374,61 +336,35 @@ function buildEvalContext(session) {
     sleep: createSleep(session),
     withTimeout: createWithTimeout(session),
     abort: session.deadline.signal,
-    timers: createBlockedTimers(),
+    ...createDisabledTimers(),
   };
 }
 
-// Execute user JavaScript in an async wrapper with scoped globals.
-async function executeUserCode(context, code) {
+// Execute user JavaScript in an async wrapper with the bindings as scope.
+async function executeUserCode(bindings, code) {
   // Return values are deliberately ignored; print(...) is the only output
-  // channel. Timer names are parameters so eval code sees our blocked versions
-  // instead of Node's process-wide timer globals.
+  // channel. Timer names are parameters so eval code sees the disabled
+  // versions instead of Node's process-wide timer globals.
   const body = `return (async () => { ${code} })();`;
-  const fn = new Function(
-    "bot", "snippets", "Vec3", "print", "sleep", "withTimeout",
-    "abort",
-    "setTimeout", "clearTimeout",
-    "setInterval", "clearInterval",
-    "setImmediate", "clearImmediate",
-    body,
-  );
+  const fn = new Function(...Object.keys(bindings), body);
 
-  await fn(
-    context.bot,
-    context.snippets,
-    context.Vec3,
-    context.print,
-    context.sleep,
-    context.withTimeout,
-    context.abort,
-    context.timers.setTimeout,
-    context.timers.clearTimeout,
-    context.timers.setInterval,
-    context.timers.clearInterval,
-    context.timers.setImmediate,
-    context.timers.clearImmediate,
-  );
+  await fn(...Object.values(bindings));
 }
 
 // Abort outstanding request work and run cleanup.
 async function finishEvalSession(session) {
-  clearTimeout(session.deadline.timeoutId);
+  session.deadline.stopTimer();
   session.res.off("close", session.onClose);
 
   // Force request-scoped awaitables and helpers to observe completion before
   // cleanup runs. On a normal success/error this reason is intentionally
   // "script-end" and is not reported to the client.
-  if (!session.deadline.signal.aborted) {
-    session.deadline.controller.abort(makeAbortError("script-end"));
-  }
+  session.deadline.abort("script-end");
 
   const cleanupErrors = await session.cleanup.run();
 
-  // Fire-and-forget facade calls may still reject after the script exits;
-  // terminal catches keep those expected abort rejections out of process logs.
-  for (const promise of session.pendingPromises) {
-    promise.catch(() => {});
-  }
+  // Late rejections are already silenced by trackPromise; dropping the
+  // references keeps fire-and-forget promises from outliving the request.
   session.pendingPromises.clear();
 
   return cleanupErrors;
@@ -436,7 +372,8 @@ async function finishEvalSession(session) {
 
 // Translate session outcome into the final HTTP response.
 function writeEvalResult(session, scriptError, cleanupErrors) {
-  const reason = abortReasonTag(session.deadline.signal.reason);
+  const { signal } = session.deadline;
+  const reason = abortReasonTag(signal.reason);
 
   if (reason === "client-disconnect") {
     if (scriptError) {
@@ -445,18 +382,23 @@ function writeEvalResult(session, scriptError, cleanupErrors) {
     return;
   }
 
-  if (scriptError && !isAbortError(scriptError)) {
+  const output = session.output.join("\n");
+  const cleanupMessages = cleanupErrors.map((error) => error.message);
+
+  // Only this request's own abort is expected here; an AbortError the script
+  // raised itself is a real script failure and is reported as one.
+  if (scriptError && scriptError !== signal.reason) {
     writeJson(session.res, 500, {
       error: scriptError.message,
       stack: scriptError.stack,
-      output: session.output.join("\n"),
-      cleanupErrors: cleanupErrors.map((error) => error.message),
+      output,
+      cleanupErrors: cleanupMessages,
     });
     return;
   }
 
   if (reason === "deadline") {
-    const timeoutMs = session.config.defaultTimeoutMs;
+    const timeoutMs = session.config.requestTimeoutMs;
     const hint = [
       `Your /eval script ran longer than this server's ${timeoutMs}ms`,
       "per-request deadline and was aborted. This is a server-imposed cap,",
@@ -469,8 +411,8 @@ function writeEvalResult(session, scriptError, cleanupErrors) {
       error: "deadline exceeded",
       timeoutMs,
       hint,
-      output: session.output.join("\n"),
-      cleanupErrors: cleanupErrors.map((error) => error.message),
+      output,
+      cleanupErrors: cleanupMessages,
     });
     return;
   }
@@ -479,11 +421,12 @@ function writeEvalResult(session, scriptError, cleanupErrors) {
     session.res,
     200,
     "text/plain",
-    session.output.join("\n") + (session.output.length ? "\n" : ""),
+    output + (session.output.length ? "\n" : ""),
   );
 }
 
-// Resolve the user snippets path. Tests may override this explicitly.
+// Resolve the user snippets path. `config.snippetsPath` overrides the default
+// location and may be relative to the current working directory.
 function getSnippetsPath(config) {
   const snippetsPath = config.snippetsPath
     || path.join(process.cwd(), ".pi", "minecraft", "snippets.js");
@@ -540,10 +483,10 @@ function loadSnippets(snippetsPath) {
 function createBotFacade(bot, session) {
   const { signal } = session.deadline;
   const { cleanup } = session;
-  const tracked = [];
+  const trackedListeners = [];
 
   cleanup.deferOnce("listeners", () => {
-    for (const { event, listener } of tracked) {
+    for (const { event, listener } of trackedListeners) {
       bot.removeListener(event, listener);
     }
   });
@@ -554,41 +497,38 @@ function createBotFacade(bot, session) {
 
   // Run an underlying bot awaitable raced against the abort signal, with
   // late library-internal rejections suppressed.
-  const racedAwait = (fn, args, onAbort = null) => {
+  const racedAwait = (start, onAbort = null) => {
     guard();
-    const promise = callPromise(fn, args);
+    const promise = callPromise(start);
     suppressOriginalPromise(promise);
     return trackPromise(session, raceAbort(signal, promise, onAbort));
   };
 
   // Wrap a plain bot method as an abort-aware awaitable.
   const awaitable = (method) => (...args) =>
-    racedAwait((...a) => bot[method](...a), args);
+    racedAwait(() => bot[method](...args));
 
   const trackListener = (event, listener) => {
-    tracked.push({ event, listener });
+    trackedListeners.push({ event, listener });
   };
 
   // Open a bot window and auto-close it on cleanup if it's still current.
   // `target` is a block (containers/furnace/anvil/enchant) or entity (villager).
-  const openWindow = (method) => (target) => {
-    guard();
-    const opening = callPromise((t) => bot[method](t), [target]);
-    suppressOriginalPromise(opening);
-    const opened = opening.then((window) => {
+  const openWindow = (method) => (target) =>
+    racedAwait(() => Promise.resolve(bot[method](target)).then((window) => {
       if (window) {
         cleanup.deferOnce(`window:${window.id}`, () => {
           if (bot.currentWindow === window) bot.closeWindow(window);
         });
       }
       return window;
-    });
-    return trackPromise(session, raceAbort(signal, opened, null));
-  };
+    }));
 
   // Bespoke members keep their cleanup contracts or special wiring inline;
   // trivial pass-throughs are populated from the lists below.
   const facade = {
+    // Disabling a control is allowed after abort so late continuations and
+    // cleanup can always stop movement; only enabling one is guarded.
     setControlState(state, value) {
       if (value) {
         guard();
@@ -600,16 +540,16 @@ function createBotFacade(bot, session) {
       return bot.setControlState(state, value);
     },
     dig(block) {
+      // Native cancellation runs on abort and again from cleanup; stopping is
+      // idempotent so the second call is a no-op.
+      let stopped = false;
       const stop = () => {
+        if (stopped) return;
+        stopped = true;
         if (bot.stopDigging) bot.stopDigging();
       };
       cleanup.deferOnce("dig", stop);
-      return racedAwait((b) => bot.dig(b), [block], () => {
-        // Native cancellation runs on abort; mark cleanup discharged so the
-        // final finally path does not call stopDigging again.
-        stop();
-        cleanup.markDone("dig");
-      });
+      return racedAwait(() => bot.dig(block), stop);
     },
     activateItem(...args) {
       guard();
@@ -619,16 +559,10 @@ function createBotFacade(bot, session) {
       return bot.activateItem(...args);
     },
     goto(goal, options) {
-      return racedAwait(
-        (g, o) => pathfinder.goto(facade, g, o),
-        [goal, options || {}],
-      );
+      return racedAwait(() => pathfinder.goto(facade, goal, options || {}));
     },
     follow(target, options) {
-      return racedAwait(
-        (t, o) => pathfinder.follow(facade, t, o),
-        [target, options || {}],
-      );
+      return racedAwait(() => pathfinder.follow(facade, target, options || {}));
     },
 
     // Window-openers auto-close on cleanup (see openWindow).
@@ -659,10 +593,10 @@ function createBotFacade(bot, session) {
     },
     removeListener(event, listener) {
       guard();
-      const idx = tracked.findIndex(
+      const idx = trackedListeners.findIndex(
         (entry) => entry.event === event && entry.listener === listener,
       );
-      if (idx >= 0) tracked.splice(idx, 1);
+      if (idx >= 0) trackedListeners.splice(idx, 1);
       return bot.removeListener(event, listener);
     },
   };
@@ -723,9 +657,9 @@ function createBotFacade(bot, session) {
 }
 
 // Call a function and normalize sync throws into promise rejection.
-function callPromise(fn, args) {
+function callPromise(fn) {
   try {
-    return Promise.resolve(fn(...args));
+    return Promise.resolve(fn());
   } catch (error) {
     return Promise.reject(error);
   }
@@ -758,36 +692,29 @@ function suppressOriginalPromise(promise) {
 // Create a keyed LIFO cleanup stack for request-scoped undo actions.
 function createCleanupStack() {
   const entries = [];
-  const keys = new Map();
+  const keys = new Set();
 
   return {
     // Add a cleanup action unless this key has already been registered.
     deferOnce(key, fn) {
       if (keys.has(key)) return;
-      const entry = { key, fn, done: false };
-      keys.set(key, entry);
-      entries.push(entry);
+      keys.add(key);
+      entries.push(fn);
     },
 
-    // Mark a cleanup action as already completed.
-    markDone(key) {
-      const entry = keys.get(key);
-      if (entry) entry.done = true;
-    },
-
-    // Run pending cleanup actions in reverse registration order.
+    // Run pending cleanup actions in reverse registration order, then forget
+    // them so a repeated run cannot undo the same intent twice.
     async run() {
       const errors = [];
       for (let i = entries.length - 1; i >= 0; i--) {
-        const entry = entries[i];
-        if (entry.done) continue;
-        entry.done = true;
         try {
-          await entry.fn();
+          await entries[i]();
         } catch (error) {
           errors.push(error);
         }
       }
+      entries.length = 0;
+      keys.clear();
       return errors;
     },
   };
@@ -828,11 +755,7 @@ function createTimerScope() {
 // Create the abort-aware sleep helper exposed to eval scripts.
 function createSleep(session) {
   return (ms) => {
-    const delay = createAbortableDelay(
-      session.timers,
-      session.deadline.signal,
-      ms,
-    );
+    const delay = createAbortableDelay(session, ms);
     return trackPromise(session, delay.promise);
   };
 }
@@ -845,11 +768,7 @@ function createWithTimeout(session) {
       throw new TypeError("withTimeout(ms, promise) requires a promise");
     }
 
-    const delay = createAbortableDelay(
-      session.timers,
-      session.deadline.signal,
-      ms,
-    );
+    const delay = createAbortableDelay(session, ms);
     const result = Promise.race([
       Promise.resolve(promise),
       delay.promise.then(() => { throw makeTimeoutError(delay.ms); }),
@@ -859,7 +778,9 @@ function createWithTimeout(session) {
 }
 
 // Create a delay promise tied to request cleanup and abort state.
-function createAbortableDelay(timers, signal, ms) {
+function createAbortableDelay(session, ms) {
+  const { timers } = session;
+  const { signal } = session.deadline;
   const delay = normalizeDelay(ms);
   let settled = false;
   let handle = null;
@@ -902,7 +823,7 @@ function createAbortableDelay(timers, signal, ms) {
 }
 
 // Create timer globals that fail with guidance inside eval scripts.
-function createBlockedTimers() {
+function createDisabledTimers() {
   const block = (name) => () => {
     throw new Error(
       `${name} is disabled in /eval; use sleep(ms) or withTimeout(ms, promise)`,
@@ -939,7 +860,8 @@ function makeTimeoutError(ms) {
 // ---------------------------------------------------------------------------
 // Chat broadcaster
 
-// Create chat event fan-out state and connect it to the bot chat event.
+// Fan player chat out to /listen clients: resolve `@aim`, build the event,
+// then write it to every live listener.
 function createChatBroadcaster(bot) {
   const clients = new Set();
 
@@ -952,28 +874,35 @@ function createChatBroadcaster(bot) {
       return;
     }
 
-    const event = {
-      type: "chat",
-      username,
-      message: expanded,
-      timestamp: new Date().toISOString(),
-    };
-    if (translate !== undefined) event.translate = translate;
-    if (matches !== undefined) event.matches = matches;
-    if (jsonMsg !== undefined && jsonMsg !== null) {
-      event.json = typeof jsonMsg.toString === "function"
-        ? jsonMsg.toString()
-        : jsonMsg;
-    }
-
-    broadcastChatEvent(clients, event);
+    broadcastChatEvent(
+      clients,
+      toChatEvent(username, expanded, translate, jsonMsg, matches),
+    );
   });
 
-  return { clients };
+  return { addClient: (res) => addChatClient(clients, res) };
 }
 
-// Add a streaming HTTP response to the chat broadcaster.
-function addChatClient(chat, res) {
+// Build the NDJSON event for one chat message.
+function toChatEvent(username, message, translate, jsonMsg, matches) {
+  const event = {
+    type: "chat",
+    username,
+    message,
+    timestamp: new Date().toISOString(),
+  };
+  if (translate !== undefined) event.translate = translate;
+  if (matches !== undefined) event.matches = matches;
+  if (jsonMsg !== undefined && jsonMsg !== null) {
+    event.json = typeof jsonMsg.toString === "function"
+      ? jsonMsg.toString()
+      : jsonMsg;
+  }
+  return event;
+}
+
+// Attach a streaming HTTP response as a chat listener.
+function addChatClient(clients, res) {
   res.writeHead(200, {
     "Content-Type": "application/x-ndjson; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
@@ -982,7 +911,7 @@ function addChatClient(chat, res) {
   });
   if (typeof res.flushHeaders === "function") res.flushHeaders();
 
-  chat.clients.add(res);
+  clients.add(res);
 
   // Keep idle fetch response bodies alive. Empty lines are ignored by clients.
   const heartbeat = setInterval(() => {
@@ -992,7 +921,7 @@ function addChatClient(chat, res) {
 
   res.on("close", () => {
     clearInterval(heartbeat);
-    chat.clients.delete(res);
+    clients.delete(res);
   });
 }
 
@@ -1051,8 +980,8 @@ function writeJson(res, status, value) {
 // ---------------------------------------------------------------------------
 // Async / abort utilities
 
-// Create a promise queue that serializes asynchronous tasks.
-function createMutex() {
+// Create a queue that runs asynchronous tasks one at a time.
+function createSerialQueue() {
   let tail = Promise.resolve();
 
   return (task) => {
@@ -1080,20 +1009,19 @@ function abortReasonTag(reason) {
   return "abort";
 }
 
-// Detect abort-style errors from local or platform sources.
-function isAbortError(error) {
-  return error && (error.name === "AbortError" || error.code === "ABORT_ERR");
-}
-
 // Race a promise against an AbortSignal and optionally cancel on abort.
-function raceAbort(signal, promise, onAbort) {
-  if (signal.aborted) {
+function raceAbort(signal, promise, onAbort = null) {
+  const cancel = () => {
     try {
       if (onAbort) onAbort();
     } catch {
       // Native cancellation is best-effort; the abort reason should remain the
       // visible failure even if cancellation itself throws.
     }
+  };
+
+  if (signal.aborted) {
+    cancel();
     return Promise.reject(signal.reason);
   }
 
@@ -1103,12 +1031,7 @@ function raceAbort(signal, promise, onAbort) {
     const abortHandler = () => {
       if (settled) return;
       settled = true;
-      try {
-        if (onAbort) onAbort();
-      } catch {
-        // Native cancellation is best-effort; the abort reason should remain
-        // the visible failure even if cancellation itself throws.
-      }
+      cancel();
       reject(signal.reason);
     };
 
